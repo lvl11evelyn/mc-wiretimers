@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.1
+// @version      1.0.2
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
 // @match        https://www.maskedcity.com/*
+// @updateURL    https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
+// @downloadURL  https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -19,6 +21,46 @@
   const PENDING_NOTE_KEY = "wireHudPendingNote:v1";
   const TICK_MS = 1000;
   const FEED_SCAN_MS = 30000;
+  const KNOWN_JOB_STARS = {
+    "Armored Truck Ambush": 4,
+    "Auction House": 4,
+    "Back Office Job": 3,
+    "Bank Siege": 4,
+    "Bolt Cutters": 1,
+    "Buyer and Seller": 2,
+    "Chop Shop": 2,
+    "Citywide Blackout": 5,
+    "Collection Day": 2,
+    "Convoy Split": 4,
+    "Dispensary Raid": 3,
+    "Evidence Room": 4,
+    "Hijacked Load": 3,
+    "Machine Ripped Out": 2,
+    "Night Shift": 2,
+    "Penthouse Job": 4,
+    "Petty Theft Call": 1,
+    "Porch Pirates": 1,
+    "Protection Racket": 3,
+    "Robbery in Progress": 2,
+    "Second-Story Man": 2,
+    "Site Security": 1,
+    "Skimmer Sweep": 2,
+    "Smash and Grab": 3,
+    "Snatch and Run": 1,
+    "Someone Is Watching": 3,
+    "Stop the Train": 5,
+    "The Bullion Run": 5,
+    "The Count Room": 4,
+    "The Crown Job": 5,
+    "The Federal Transfer": 5,
+    "The Loan Exhibit": 4,
+    "The Tower Job": 5,
+    "Till Jumper": 1,
+    "Under the Car": 1,
+    "Walk-Out": 1,
+    "War in the Street": 5,
+    "Working the Gala": 3,
+  };
 
   let timerId = null;
   let lastFeedScanAt = 0;
@@ -147,11 +189,19 @@
     }
   }
 
+  function getSeededNotes() {
+    return Object.entries(KNOWN_JOB_STARS).map(([title, stars]) => ({ title, stars }));
+  }
+
+  function getKnownNotes() {
+    return getSeededNotes().concat(Object.values(readSavedNotes()));
+  }
+
   function findKnownNoteByTitle(title) {
     const normalizedTitle = String(title || "").trim().toLowerCase();
     if (!normalizedTitle) return null;
 
-    const matches = Object.values(readSavedNotes()).filter((note) => {
+    const matches = getKnownNotes().filter((note) => {
       return String(note.title || "").trim().toLowerCase() === normalizedTitle && note.stars;
     });
 
@@ -162,7 +212,7 @@
   function buildRosterExport() {
     const byTitle = new Map();
 
-    Object.values(readSavedNotes()).forEach((note) => {
+    getKnownNotes().forEach((note) => {
       const title = String(note.title || "").trim();
       if (!title || !note.stars) return;
 
