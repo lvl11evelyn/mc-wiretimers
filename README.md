@@ -18,6 +18,13 @@ District markers:
 - `🏴‍☠️` Villain controlled
 - `⚔️` Siege
 
+District Shorthand:
+- `M` Mid-City
+- `I` Industrial
+- `H` Heights
+- `S` Slums
+- `D` Downtown
+
 ## Install
 
 This is a userscript, so it requires a userscript manager. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser first, then install the script URL below.
