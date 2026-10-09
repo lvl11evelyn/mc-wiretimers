@@ -21,6 +21,8 @@
   const PENDING_NOTE_KEY = "wireHudPendingNote:v1";
   const TICK_MS = 1000;
   const FEED_SCAN_MS = 30000;
+  // Known Hero-aligned Wire titles. Villain-side mirror titles may differ and
+  // are still learned locally from the board when encountered.
   const KNOWN_JOB_STARS = {
     "Armored Truck Ambush": 4,
     "Auction House": 4,

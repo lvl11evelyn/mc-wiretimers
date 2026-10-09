@@ -32,11 +32,13 @@ The script also uses that URL for Tampermonkey update/download metadata.
 
 ## How It Works
 
-When a Wire task is active, the script reads the page's `.wb-job` data, stores the task locally, and keeps the HUD timer visible while you move around the site. It uses the Wire board to learn task metadata, and includes a built-in title-to-star registry to avoid ambiguity when only the active task title is visible.
+When a Wire task is active, the script reads the page's `.wb-job` data, stores the task locally, and keeps the HUD timer visible while you move around the site. It uses the Wire board to learn task metadata, and includes a built-in Hero-aligned title-to-star registry to avoid ambiguity when only the active task title is visible.
 
-The roster export button, `⤵️`, copies the known Wire title roster to your clipboard. It includes both built-in titles and any newly learned titles from future board visits.
+The roster export button, `⤵️`, copies the known Wire title roster to your clipboard. It includes both built-in Hero-aligned titles and any newly learned titles from future board visits, including villain-side mirrors if the script sees them.
 
-## Built-In Job Registry
+## Built-In Hero Job Registry
+
+This registry is currently based on Hero-aligned Wire content. Villain mirror titles are not included unless learned locally from your own board visits.
 
 ### 1★
 
