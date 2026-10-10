@@ -9,7 +9,7 @@ Tampermonkey userscript for Masked City that adds a compact Wire task timer to t
 - Freezes the delay timer once a check-in is answered.
 - Shows overall task progress and remaining task time.
 - Displays compact task context: district initial, star count, and district control marker.
-- Supports both the classic HUD and the newer `v2-nav` layout.
+- Supports both the classic and new layouts.
 - Hides automatically on narrow screens.
 
 District markers:
@@ -27,15 +27,9 @@ District Shorthand:
 
 ## Install
 
-This is a userscript, so it requires a userscript manager. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser first, then install the script URL below.
-
-Install with Tampermonkey from:
-
-```text
-https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
-```
-
-The script also uses that URL for Tampermonkey update/download metadata.
+- [Tampermonkey](https://www.tampermonkey.net/) should be installed first.
+- [Click here](https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js) to install the Userscript.
+- It will update automatically according to your update check preferences.
 
 ## How It Works
 
