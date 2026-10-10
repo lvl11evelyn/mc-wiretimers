@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.2
+// @version      1.0.3
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -561,6 +561,25 @@
     return `${minutes}:${String(seconds).padStart(2, "0")}`;
   }
 
+  function clamp(number, min, max) {
+    return Math.min(max, Math.max(min, number));
+  }
+
+  function mixChannel(start, end, percent) {
+    return Math.round(start + (end - start) * percent);
+  }
+
+  function mixColor(start, end, percent) {
+    const amount = clamp(percent, 0, 1);
+    return `rgb(${mixChannel(start[0], end[0], amount)}, ${mixChannel(start[1], end[1], amount)}, ${mixChannel(start[2], end[2], amount)})`;
+  }
+
+  function getLateColor(startedAt, endsAt, now) {
+    const lateWindow = Math.max(1, endsAt - startedAt);
+    const latePercent = clamp((now - startedAt) / lateWindow, 0, 1);
+    return mixColor([255, 155, 176], [255, 0, 0], latePercent);
+  }
+
   function ensureStyles() {
     if (document.getElementById("wireHudStyles")) return;
 
@@ -659,22 +678,23 @@
         background: linear-gradient(90deg, #ffb020, #20e3ff);
       }
 
-      .wire-hud__row.is-ready .wire-hud__fill {
+      .wire-hud__row.is-late .wire-hud__fill {
         width: 100%;
-        background: #42ff83;
+        background: var(--wire-late-color, #ff9bb0);
       }
 
-      .wire-hud__row.is-ready .wire-hud__time {
-        color: #42ff83;
+      .wire-hud__row.is-late .wire-hud__time {
+        color: var(--wire-late-color, #ff9bb0);
       }
 
       .wire-hud__row.is-answered .wire-hud__fill {
         width: 100%;
-        background: #94caff;
+        background: #6f7782;
       }
 
+      .wire-hud__row.is-answered .wire-hud__label,
       .wire-hud__row.is-answered .wire-hud__time {
-        color: #94caff;
+        color: #6f7782;
       }
 
       @media (max-width: 980px) {
@@ -757,10 +777,12 @@
         const label = `Check-In #${item.index}:`;
         const readyElapsed = (answered ? item.answeredAt : now) - item.at;
         const time = ready ? `+${formatRemaining(readyElapsed)}` : formatRemaining(item.at - now);
-        const stateClass = answered ? " is-answered" : ready ? " is-ready" : "";
+        const lateColor = ready && !answered ? getLateColor(item.at, job.ends, now) : "";
+        const stateClass = answered ? " is-answered" : ready ? " is-late" : "";
+        const rowStyle = lateColor ? ` style="--wire-late-color:${lateColor}"` : "";
 
         return `
-          <div class="wire-hud__row${stateClass}">
+          <div class="wire-hud__row${stateClass}"${rowStyle}>
             <span class="wire-hud__label">${label}</span>
             <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${percent.toFixed(2)}%"></span></span>
             <span class="wire-hud__time">${time}</span>
