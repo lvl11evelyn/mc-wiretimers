@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.7
+// @version      1.0.8
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -22,6 +22,7 @@
   const PENDING_NOTE_KEY = "wireHudPendingNote:v1";
   const TICK_MS = 1000;
   const FEED_SCAN_MS = 30000;
+  const PAYOUT_RATIO_TOLERANCE = 0.025;
   // Known Hero-aligned Wire titles. Villain-side mirror titles may differ and
   // are still learned locally from the board when encountered.
   const KNOWN_JOB_STARS = {
@@ -71,6 +72,8 @@
   let lastFeedScanAt = 0;
   let answerClickListenerBound = false;
   let menuCommandBound = false;
+  let boardObserver = null;
+  let boardScanQueued = false;
   const submittingCheckins = new Set();
 
   function readNumber(value) {
@@ -179,6 +182,74 @@
     if (control.controller === "villain") return "🏴‍☠️";
     if (control.status === "siege") return "⚔️";
     return "";
+  }
+
+  function getControlKind(control) {
+    if (!control) return "";
+    if (control.controller === "hero") return "hero";
+    if (control.controller === "villain") return "villain";
+    if (control.status === "siege" || control.controller === null) return "uncontrolled";
+    return "";
+  }
+
+  function getControlIcon(kind) {
+    if (kind === "hero") return "🛡️";
+    if (kind === "villain") return "🏴‍☠️";
+    if (kind === "uncontrolled") return "⚔️";
+    return "";
+  }
+
+  function getControlClass(kind) {
+    if (kind === "hero") return "h_c";
+    if (kind === "villain") return "v_c";
+    if (kind === "uncontrolled") return "u_c";
+    return "";
+  }
+
+  function relationToControlKind(relation) {
+    const alignment = getPlayerAlignment();
+    if (relation === "base") return "uncontrolled";
+    if (!alignment) return "";
+
+    if (relation === "friendly") return alignment;
+    if (relation === "opposing") return alignment === "hero" ? "villain" : "hero";
+    return "";
+  }
+
+  function ratiosMatch(first, second, target) {
+    if (!Number.isFinite(first) || !Number.isFinite(second) || !target) return false;
+    return Math.abs(first - target) / target <= PAYOUT_RATIO_TOLERANCE &&
+      Math.abs(second - target) / target <= PAYOUT_RATIO_TOLERANCE;
+  }
+
+  function inferPayoutRelationship(lowNote, highNote) {
+    if (!lowNote?.low || !lowNote?.high || !highNote?.low || !highNote?.high) return null;
+
+    const lowRatio = highNote.low / lowNote.low;
+    const highRatio = highNote.high / lowNote.high;
+    const relationships = [
+      { ratio: 1.25, low: "base", high: "friendly" },
+      { ratio: 1 / 0.85, low: "opposing", high: "base" },
+      { ratio: 1.25 / 0.85, low: "opposing", high: "friendly" },
+    ];
+
+    return relationships.find((item) => ratiosMatch(lowRatio, highRatio, item.ratio)) || null;
+  }
+
+  function saveWireInferredControls(inferred) {
+    const entries = Object.entries(inferred || {}).filter(([, kind]) => kind);
+    if (!entries.length) return;
+
+    const state = readControlState();
+    entries.forEach(([district, kind]) => {
+      state.districts[normalizeDistrict(district)] = buildControlRecord({
+        district,
+        controller: kind === "hero" || kind === "villain" ? kind : null,
+        status: kind === "uncontrolled" ? "siege" : "controlled",
+        source: "wire-payout",
+      });
+    });
+    writeControlState(state);
   }
 
   function getNoteKey(note) {
@@ -301,7 +372,13 @@
     const notes = Array.from(document.querySelectorAll(".wb-note[data-stars][data-district]"));
     if (!notes.length) return;
 
+    ensureStyles();
+
     const saved = readSavedNotes();
+    const controlState = readControlState();
+    const directByDistrict = {};
+    const inferredByDistrict = {};
+    const noteRecords = [];
 
     notes.forEach((node) => {
       const note = {
@@ -312,15 +389,109 @@
         minutes: readNumber(node.dataset.minutes),
         low: readNumber(node.dataset.low),
         high: readNumber(node.dataset.high),
+        node,
       };
 
       if (!note.district || !note.stars || !note.minutes) return;
-      saved[getNoteKey(note)] = note;
+      saved[getNoteKey(note)] = {
+        id: note.id,
+        title: note.title,
+        district: note.district,
+        stars: note.stars,
+        minutes: note.minutes,
+        low: note.low,
+        high: note.high,
+      };
+      noteRecords.push(note);
 
-      node.addEventListener("click", () => writePendingNote(note), { passive: true });
+      const district = normalizeDistrict(note.district);
+      const directKind = getControlKind(controlState.districts[district]);
+      if (directKind) directByDistrict[district] = directKind;
+
+      if (!node.dataset.wireHudClickBound) {
+        node.dataset.wireHudClickBound = "1";
+        node.addEventListener("click", () => writePendingNote(saved[getNoteKey(note)]), { passive: true });
+      }
     });
 
+    inferBoardDistrictControls(noteRecords, inferredByDistrict);
+    saveWireInferredControls(inferredByDistrict);
+    annotateBoardNotes(noteRecords, inferredByDistrict, directByDistrict);
     localStorage.setItem(NOTE_STORE_KEY, JSON.stringify(saved));
+  }
+
+  function inferBoardDistrictControls(notes, inferredByDistrict) {
+    const byStars = new Map();
+
+    notes.forEach((note) => {
+      if (!note.stars || !note.low || !note.high) return;
+      if (!byStars.has(note.stars)) byStars.set(note.stars, []);
+      byStars.get(note.stars).push(note);
+    });
+
+    byStars.forEach((starNotes) => {
+      for (let index = 0; index < starNotes.length; index += 1) {
+        for (let compareIndex = index + 1; compareIndex < starNotes.length; compareIndex += 1) {
+          const first = starNotes[index];
+          const second = starNotes[compareIndex];
+          if (normalizeDistrict(first.district) === normalizeDistrict(second.district)) continue;
+
+          const ordered = first.low <= second.low ? [first, second] : [second, first];
+          const relationship = inferPayoutRelationship(ordered[0], ordered[1]);
+          if (!relationship) continue;
+
+          const lowKind = relationToControlKind(relationship.low);
+          const highKind = relationToControlKind(relationship.high);
+          setInferredDistrictKind(inferredByDistrict, ordered[0].district, lowKind);
+          setInferredDistrictKind(inferredByDistrict, ordered[1].district, highKind);
+        }
+      }
+    });
+  }
+
+  function setInferredDistrictKind(inferredByDistrict, district, kind) {
+    if (!kind) return;
+
+    const normalizedDistrict = normalizeDistrict(district);
+    const existing = inferredByDistrict[normalizedDistrict];
+    inferredByDistrict[normalizedDistrict] = existing && existing !== kind ? "" : kind;
+  }
+
+  function annotateBoardNotes(notes, inferredByDistrict, directByDistrict) {
+    notes.forEach((note) => {
+      const district = normalizeDistrict(note.district);
+      const kind = inferredByDistrict[district] || directByDistrict[district] || "";
+      const icon = getControlIcon(kind);
+      const controlClass = getControlClass(kind);
+
+      note.node.classList.remove("h_c", "v_c", "u_c");
+      if (controlClass) note.node.classList.add(controlClass);
+
+      const existing = note.node.querySelector(".wire-note-control");
+      if (!icon) {
+        existing?.remove();
+        return;
+      }
+
+      const label = kind === "hero" ? "Hero controlled" : kind === "villain" ? "Villain controlled" : "Contested";
+      const marker = existing || document.createElement("span");
+      marker.className = "wire-note-control";
+      marker.textContent = icon;
+      marker.title = label;
+      marker.setAttribute("aria-label", label);
+
+      const meta = note.node.querySelector(".wb-note__meta");
+      const districtLabel = meta?.firstElementChild;
+      const target = meta || note.node.querySelector(".wb-note__body") || note.node;
+
+      if (districtLabel) {
+        if (marker.parentElement !== target || marker.nextElementSibling !== districtLabel) {
+          target.insertBefore(marker, districtLabel);
+        }
+      } else if (!existing) {
+        target.appendChild(marker);
+      }
+    });
   }
 
   function scanCityDistricts() {
@@ -775,6 +946,44 @@
         color: #6f7782;
       }
 
+      .wire-note-control {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-right: 4px;
+        line-height: 1;
+      }
+
+      .wb-note.h_c {
+        filter: drop-shadow(2px 2px 4px #88f);
+      }
+
+      .wb-note.h_c .wb-note__body {
+        background: #88f1;
+        box-shadow: 0 0 4px 6px #88f1;
+        border-radius: 3px;
+      }
+
+      .wb-note.v_c {
+        filter: drop-shadow(2px 2px 4px #f88);
+      }
+
+      .wb-note.v_c .wb-note__body {
+        background: #f881;
+        box-shadow: 0 0 4px 6px #f881;
+        border-radius: 3px;
+      }
+
+      .wb-note.u_c {
+        filter: drop-shadow(2px 2px 4px #111);
+      }
+
+      .wb-note.u_c .wb-note__body {
+        background: #1111;
+        box-shadow: 0 0 4px 6px #1111;
+        border-radius: 3px;
+      }
+
       @media (max-width: 980px) {
         .wire-hud {
           display: none;
@@ -820,6 +1029,29 @@
     const ident = hud.querySelector(".ident");
     hud.insertBefore(widget, ident || hud.querySelector(".hud__tools") || null);
     return widget;
+  }
+
+  function queueBoardScan() {
+    if (boardScanQueued) return;
+    boardScanQueued = true;
+
+    window.setTimeout(() => {
+      boardScanQueued = false;
+      scanBoardNotes();
+    }, 50);
+  }
+
+  function observeBoardNotes() {
+    if (boardObserver) return;
+
+    const board = document.querySelector("#wbGrid, .wb-grid, .wb-board");
+    if (!board) return;
+
+    boardObserver = new MutationObserver((mutations) => {
+      if (!mutations.some((mutation) => mutation.type === "childList")) return;
+      queueBoardScan();
+    });
+    boardObserver.observe(board, { childList: true, subtree: true });
   }
 
   function render(job) {
@@ -914,6 +1146,7 @@
     }
 
     scanBoardNotes();
+    observeBoardNotes();
     scanCityDistricts();
     scanWatchtowerDistricts();
     scanFeedEvents(true);
