@@ -10,6 +10,7 @@ Tampermonkey userscript for Masked City that adds a compact Wire task timer to t
 - Lets ready check-in rows submit the check-in directly, falling back to `/wire` for manual attendance if anything unexpected happens.
 - Shows overall task progress and remaining task time.
 - Displays compact task context: district initial, star count, and district control marker.
+- Marks available Wire board notes with district controller emblems while you are choosing a task.
 - Supports both the classic HUD and the newer `v2-nav` layout.
 - Hides automatically on narrow screens.
 
@@ -43,6 +44,12 @@ The script also uses that URL for Tampermonkey update/download metadata.
 When a Wire task is active, the script reads the page's `.wb-job` data, stores the task locally, and keeps the HUD timer visible while you move around the site. It uses the Wire board to learn task metadata, and includes a built-in Hero-aligned title-to-star registry to avoid ambiguity when only the active task title is visible. Ready check-in rows send one same-origin check-in request; any failed, redirected, non-JSON, or unexpected response navigates to `/wire` instead of retrying.
 
 The Tampermonkey menu command **Copy Wire job roster** copies the known Wire title roster to your clipboard. It includes both built-in Hero-aligned titles and any newly learned titles from future board visits, including villain-side mirrors if the script sees them.
+
+## Board Emblems
+
+On the Wire board, each available note can receive a controller emblem directly before its district name. The script uses currently observed Watchtower/City control states when available, and can also infer control from same-star payout range comparisons on the visible board.
+
+Confident Wire payout inference can update stale stored territory state because the displayed payout range is actionable, current Wire data. Inference is limited to matching star counts and requires both payout endpoints to match the same territory multiplier relationship within tolerance.
 
 ## Check-In Initiation
 
