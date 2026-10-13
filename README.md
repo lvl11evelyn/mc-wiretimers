@@ -7,6 +7,7 @@ Tampermonkey userscript for Masked City that adds a compact Wire task timer to t
 - Shows active Wire check-in countdowns in the HUD.
 - Tracks how long each check-in has been ready.
 - Freezes the delay timer once a check-in is answered.
+- Links ready check-in rows back to `/wire`.
 - Shows overall task progress and remaining task time.
 - Displays compact task context: district initial, star count, and district control marker.
 - Supports both the classic HUD and the newer `v2-nav` layout.
