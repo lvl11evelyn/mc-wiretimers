@@ -7,7 +7,7 @@ Tampermonkey userscript for Masked City that adds a compact Wire task timer to t
 - Shows active Wire check-in countdowns in the HUD.
 - Tracks how long each check-in has been ready.
 - Freezes the delay timer once a check-in is answered.
-- Links ready check-in rows back to `/wire`.
+- Lets ready check-in rows submit the check-in directly, falling back to `/wire` for manual attendance if anything unexpected happens.
 - Shows overall task progress and remaining task time.
 - Displays compact task context: district initial, star count, and district control marker.
 - Supports both the classic HUD and the newer `v2-nav` layout.
@@ -40,9 +40,15 @@ The script also uses that URL for Tampermonkey update/download metadata.
 
 ## How It Works
 
-When a Wire task is active, the script reads the page's `.wb-job` data, stores the task locally, and keeps the HUD timer visible while you move around the site. It uses the Wire board to learn task metadata, and includes a built-in Hero-aligned title-to-star registry to avoid ambiguity when only the active task title is visible.
+When a Wire task is active, the script reads the page's `.wb-job` data, stores the task locally, and keeps the HUD timer visible while you move around the site. It uses the Wire board to learn task metadata, and includes a built-in Hero-aligned title-to-star registry to avoid ambiguity when only the active task title is visible. Ready check-in rows send one same-origin check-in request; any failed, redirected, non-JSON, or unexpected response navigates to `/wire` instead of retrying.
 
 The Tampermonkey menu command **Copy Wire job roster** copies the known Wire title roster to your clipboard. It includes both built-in Hero-aligned titles and any newly learned titles from future board visits, including villain-side mirrors if the script sees them.
+
+## Check-In Initiation
+
+When a check-in is ready, its HUD row becomes clickable. A normal click sends one same-origin `POST /wire/check-in` request using the page's current CSRF token and the matching check-in index.
+
+The script only treats the action as successful when the response is JSON and contains `ok: true`. Any unexpected response, including a redirect, failed status, non-JSON body, expired token, stale task state, network error, timeout, or `ok: false`, sends the browser to `/wire` for manual resolution.
 
 ## Built-In Hero Job Registry
 
