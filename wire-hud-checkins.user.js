@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.4
+// @version      1.0.6
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -9,7 +9,8 @@
 // @updateURL    https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
 // @downloadURL  https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
 // @run-at       document-idle
-// @grant        none
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // ==/UserScript==
 
 (function () {
@@ -32,6 +33,7 @@
     "Buyer and Seller": 2,
     "Chop Shop": 2,
     "Citywide Blackout": 5,
+    "Cloned Badge": 3,
     "Collection Day": 2,
     "Convoy Split": 4,
     "Dispensary Raid": 3,
@@ -57,6 +59,7 @@
     "The Federal Transfer": 5,
     "The Loan Exhibit": 4,
     "The Tower Job": 5,
+    "The Vault": 5,
     "Till Jumper": 1,
     "Under the Car": 1,
     "Walk-Out": 1,
@@ -67,6 +70,7 @@
   let timerId = null;
   let lastFeedScanAt = 0;
   let answerClickListenerBound = false;
+  let menuCommandBound = false;
 
   function readNumber(value) {
     const number = Number(value);
@@ -232,6 +236,11 @@
   }
 
   function copyText(text) {
+    if (typeof GM_setClipboard === "function") {
+      GM_setClipboard(text, "text");
+      return Promise.resolve();
+    }
+
     if (navigator.clipboard?.writeText) {
       return navigator.clipboard.writeText(text);
     }
@@ -247,24 +256,17 @@
     return copied ? Promise.resolve() : Promise.reject(new Error("Copy failed"));
   }
 
-  function exportRoster(button) {
+  function exportRoster(button = null) {
     const text = buildRosterExport() || "No Wire board jobs have been learned yet.";
     copyText(text)
       .then(() => {
-        button.dataset.state = "copied";
-        button.setAttribute("aria-label", "Wire roster copied");
-        setTimeout(() => {
-          button.dataset.state = "";
-          button.setAttribute("aria-label", "Copy learned Wire roster");
-        }, 1400);
+        if (!button) {
+          console.info("Wire job roster copied.");
+          return;
+        }
       })
       .catch(() => {
-        button.dataset.state = "failed";
-        button.setAttribute("aria-label", "Copy failed");
-        setTimeout(() => {
-          button.dataset.state = "";
-          button.setAttribute("aria-label", "Copy learned Wire roster");
-        }, 1800);
+        console.warn("Wire job roster copy failed.");
       });
   }
 
@@ -618,8 +620,19 @@
         white-space: nowrap;
       }
 
+      a.wire-hud__row {
+        color: inherit;
+        text-decoration: none;
+        cursor: pointer;
+      }
+
+      a.wire-hud__row:hover .wire-hud__label,
+      a.wire-hud__row:hover .wire-hud__time {
+        text-decoration: underline;
+      }
+
       .wire-hud__row--task {
-        grid-template-columns: max-content minmax(64px, 1fr) max-content 18px;
+        grid-template-columns: max-content minmax(64px, 1fr) max-content;
       }
 
       .wire-hud__label {
@@ -645,29 +658,6 @@
         min-width: 38px;
         text-align: right;
         color: #fff;
-      }
-
-      .wire-hud__export {
-        width: 16px;
-        height: 16px;
-        display: inline-grid;
-        place-items: center;
-        padding: 0;
-        border: 0;
-        background: transparent;
-        color: #94caff;
-        cursor: pointer;
-        font: inherit;
-        line-height: 1;
-      }
-
-      .wire-hud__export:hover,
-      .wire-hud__export[data-state="copied"] {
-        color: #42ff83;
-      }
-
-      .wire-hud__export[data-state="failed"] {
-        color: #ff6868;
       }
 
       .wire-hud__row--task .wire-hud__label {
@@ -780,13 +770,15 @@
         const lateColor = ready && !answered ? getLateColor(item.at, job.ends, now) : "";
         const stateClass = answered ? " is-answered" : ready ? " is-late" : "";
         const rowStyle = lateColor ? ` style="--wire-late-color:${lateColor}"` : "";
+        const tagName = ready && !answered ? "a" : "div";
+        const href = ready && !answered ? ' href="/wire"' : "";
 
         return `
-          <div class="wire-hud__row${stateClass}"${rowStyle}>
+          <${tagName}${href} class="wire-hud__row${stateClass}"${rowStyle}>
             <span class="wire-hud__label">${label}</span>
             <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${percent.toFixed(2)}%"></span></span>
             <span class="wire-hud__time">${time}</span>
-          </div>
+          </${tagName}>
         `;
       });
 
@@ -801,7 +793,6 @@
         <span class="wire-hud__label">${taskLabel}:</span>
         <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${taskPercent.toFixed(2)}%"></span></span>
         <span class="wire-hud__time">${formatRemaining(job.ends - now)}</span>
-        <button type="button" class="wire-hud__export" data-wire-export aria-label="Copy learned Wire roster" title="Copy learned Wire roster">⤵️</button>
       </div>
     `;
 
@@ -809,16 +800,14 @@
   }
 
   function start() {
+    if (!menuCommandBound && typeof GM_registerMenuCommand === "function") {
+      menuCommandBound = true;
+      GM_registerMenuCommand("Copy Wire job roster", () => exportRoster());
+    }
+
     if (!answerClickListenerBound) {
       answerClickListenerBound = true;
       document.addEventListener("click", (event) => {
-        const exportButton = event.target.closest("[data-wire-export]");
-        if (exportButton) {
-          event.preventDefault();
-          exportRoster(exportButton);
-          return;
-        }
-
         const button = event.target.closest("[data-wb-answer]");
         if (button) markCheckinAnswered(button.dataset.wbAnswer);
       }, true);
