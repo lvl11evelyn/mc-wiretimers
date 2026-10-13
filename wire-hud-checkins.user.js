@@ -952,6 +952,7 @@
         justify-content: center;
         margin-right: 4px;
         line-height: 1;
+        transform: scale(1.6);
         filter: drop-shadow(1px 1px 1px #0008) drop-shadow(1px 1px 0px #000);
       }
 
