@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.8
+// @version      1.0.9
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -952,6 +952,7 @@
         justify-content: center;
         margin-right: 4px;
         line-height: 1;
+        filter: drop-shadow(1px 1px 1px #0008) drop-shadow(1px 1px 0px #000);
       }
 
       .wb-note.h_c {
