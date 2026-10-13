@@ -169,10 +169,10 @@
 
   function classifyDistrict(control) {
     if (!control) return "";
-    if (control.status === "siege") return "⚔️";
 
     if (control.controller === "hero") return "🛡️";
     if (control.controller === "villain") return "🏴‍☠️";
+    if (control.status === "siege") return "⚔️";
     return "";
   }
 
@@ -324,6 +324,7 @@
     const records = Array.from(document.querySelectorAll(".district-panel")).map((panel) => {
       const district = normalizeDistrict(panel.querySelector(".district-name")?.textContent || "");
       const title = panel.querySelector(".district-war")?.getAttribute("title") || "";
+      const owner = panel.querySelector(".district-war-owner")?.textContent?.trim()?.toLowerCase();
       const match = title.match(/(\d+)%\s*Hero\s*\/\s*(\d+)%\s*Villain(?:\s*—\s*(Hero|Villain)\s+controlled)?/i);
 
       if (!district || !match) return null;
@@ -332,7 +333,7 @@
         district,
         heroPct: match[1],
         villainPct: match[2],
-        controller: match[3]?.toLowerCase() || null,
+        controller: owner === "hero" || owner === "villain" ? owner : match[3]?.toLowerCase() || null,
         status: panel.classList.contains("is-siege") || /siege/i.test(title) ? "siege" : "controlled",
         source: "city",
       });
@@ -344,12 +345,11 @@
   function scanWatchtowerDistricts() {
     const records = Array.from(document.querySelectorAll(".wt-cell[data-district]")).map((cell) => {
       const controller = cell.querySelector(".wt-cell__who")?.textContent?.trim()?.toLowerCase();
-      if (controller !== "hero" && controller !== "villain") return null;
 
       return buildControlRecord({
         district: cell.dataset.district,
-        controller,
-        status: /siege/i.test(cell.textContent) || /siege/i.test(cell.title) ? "siege" : "controlled",
+        controller: controller === "hero" || controller === "villain" ? controller : null,
+        status: cell.classList.contains("wt-cell--siege") || /siege/i.test(cell.textContent) || /siege/i.test(cell.title) ? "siege" : "controlled",
         source: "watchtower",
       });
     }).filter(Boolean);
