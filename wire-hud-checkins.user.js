@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.6
+// @version      1.0.7
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -71,6 +71,7 @@
   let lastFeedScanAt = 0;
   let answerClickListenerBound = false;
   let menuCommandBound = false;
+  const submittingCheckins = new Set();
 
   function readNumber(value) {
     const number = Number(value);
@@ -545,6 +546,78 @@
     }
   }
 
+  function goToWire() {
+    window.location.assign("/wire");
+  }
+
+  function getCsrfToken() {
+    const field = document.querySelector('input[name="csrf_token"], input[name="_csrf"], meta[name="csrf-token"]');
+    const fieldToken = field?.value || field?.content;
+    if (fieldToken) return fieldToken;
+
+    const cookie = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("mc.csrf="));
+
+    return cookie ? decodeURIComponent(cookie.slice("mc.csrf=".length)) : "";
+  }
+
+  async function submitHudCheckin(answerIndex) {
+    const normalizedIndex = Number(answerIndex);
+    if (!Number.isInteger(normalizedIndex) || normalizedIndex < 0) {
+      goToWire();
+      return;
+    }
+
+    if (submittingCheckins.has(normalizedIndex)) return;
+    submittingCheckins.add(normalizedIndex);
+
+    const token = getCsrfToken();
+    if (!token) {
+      goToWire();
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const response = await fetch("/wire/check-in", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+        body: new URLSearchParams({
+          csrf_token: token,
+          index: String(normalizedIndex),
+        }),
+        signal: controller.signal,
+      });
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok || !contentType.includes("application/json")) {
+        goToWire();
+        return;
+      }
+
+      const data = await response.json();
+      if (!data || data.ok !== true) {
+        goToWire();
+        return;
+      }
+
+      markCheckinAnswered(normalizedIndex);
+    } catch {
+      goToWire();
+    } finally {
+      window.clearTimeout(timeoutId);
+      submittingCheckins.delete(normalizedIndex);
+    }
+  }
+
   function clearJob() {
     localStorage.removeItem(STORE_KEY);
     document.querySelector(".wire-hud")?.remove();
@@ -620,14 +693,29 @@
         white-space: nowrap;
       }
 
-      a.wire-hud__row {
+      .wire-hud__link,
+      .v2-nav a.wire-hud__link {
+        display: block;
+        flex: none;
+        min-width: 0;
+        max-width: none;
+        width: 100%;
+        height: auto;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
         color: inherit;
+        font: inherit;
+        letter-spacing: inherit;
+        white-space: inherit;
         text-decoration: none;
+        transition: none;
         cursor: pointer;
       }
 
-      a.wire-hud__row:hover .wire-hud__label,
-      a.wire-hud__row:hover .wire-hud__time {
+      .wire-hud__link:hover .wire-hud__label,
+      .wire-hud__link:hover .wire-hud__time {
         text-decoration: underline;
       }
 
@@ -770,16 +858,21 @@
         const lateColor = ready && !answered ? getLateColor(item.at, job.ends, now) : "";
         const stateClass = answered ? " is-answered" : ready ? " is-late" : "";
         const rowStyle = lateColor ? ` style="--wire-late-color:${lateColor}"` : "";
-        const tagName = ready && !answered ? "a" : "div";
-        const href = ready && !answered ? ' href="/wire"' : "";
-
-        return `
-          <${tagName}${href} class="wire-hud__row${stateClass}"${rowStyle}>
+        const row = `
+          <span class="wire-hud__row${stateClass}"${rowStyle}>
             <span class="wire-hud__label">${label}</span>
             <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${percent.toFixed(2)}%"></span></span>
             <span class="wire-hud__time">${time}</span>
-          </${tagName}>
+          </span>
         `;
+
+        return ready && !answered
+          ? `<a href="/wire" class="wire-hud__link" data-wire-hud-answer="${item.index - 1}" aria-label="${label} ready, answer Wire check-in">${row}</a>`
+          : `<div class="wire-hud__row${stateClass}"${rowStyle}>
+              <span class="wire-hud__label">${label}</span>
+              <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${percent.toFixed(2)}%"></span></span>
+              <span class="wire-hud__time">${time}</span>
+            </div>`;
       });
 
     const taskTotal = Math.max(1, job.ends - job.starts);
@@ -808,6 +901,13 @@
     if (!answerClickListenerBound) {
       answerClickListenerBound = true;
       document.addEventListener("click", (event) => {
+        const hudLink = event.target.closest("[data-wire-hud-answer]");
+        if (hudLink && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+          event.preventDefault();
+          submitHudCheckin(hudLink.dataset.wireHudAnswer);
+          return;
+        }
+
         const button = event.target.closest("[data-wb-answer]");
         if (button) markCheckinAnswered(button.dataset.wbAnswer);
       }, true);
