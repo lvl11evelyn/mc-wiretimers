@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.10
+// @version      1.0.11
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -20,6 +20,7 @@
   const NOTE_STORE_KEY = "wireHudNotes:v1";
   const CONTROL_STORE_KEY = "wireHudDistrictControl:v1";
   const PENDING_NOTE_KEY = "wireHudPendingNote:v1";
+  const ALIGNMENT_STORE_KEY = "wireHudPlayerAlignment:v1";
   const TICK_MS = 1000;
   const FEED_SCAN_MS = 30000;
   const PAYOUT_RATIO_TOLERANCE = 0.025;
@@ -117,10 +118,111 @@
     return abbreviations[district] || district;
   }
 
+  function getOwnProfileUrl() {
+    const href = document.querySelector("aside.v2-left .v2-me__name a[href]")?.getAttribute("href");
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.origin !== location.origin || !/^\/profile\/\d+\/?$/.test(url.pathname)) return null;
+      url.pathname = url.pathname.replace(/\/$/, "");
+      url.search = "";
+      url.hash = "";
+      return url;
+    } catch {
+      return null;
+    }
+  }
+
+  function readPlayerAlignment(profileUrl = getOwnProfileUrl()) {
+    if (!profileUrl) return null;
+    try {
+      const state = JSON.parse(localStorage.getItem(ALIGNMENT_STORE_KEY) || "null");
+      return state?.profile === profileUrl.pathname &&
+        (state.alignment === "hero" || state.alignment === "villain") ? state : null;
+    } catch {
+      return null;
+    }
+  }
+
   function getPlayerAlignment() {
-    const raw = document.documentElement.dataset.align || document.body?.dataset.align || "";
-    const align = raw.toLowerCase();
-    return align === "hero" || align === "villain" ? align : null;
+    return readPlayerAlignment()?.alignment || null;
+  }
+
+  function parseProfileAlignment(root) {
+    // Use semantic profile data, never theme, stat color, or rank/title text.
+    const chips = root.querySelectorAll(".pf-chips .pf-chip");
+    const hero = Array.from(chips).some((chip) => chip.classList.contains("pf-chip--hero"));
+    const villain = Array.from(chips).some((chip) => chip.classList.contains("pf-chip--villain"));
+    let reputation = null;
+    for (const row of root.querySelectorAll(".lr-kv")) {
+      const value = row.querySelector(".lr-kv__v");
+      if (!value) continue;
+      const label = row.cloneNode(true);
+      label.querySelectorAll(".lr-kv__v").forEach((node) => node.remove());
+      if (!/^reputation\s*:?$/i.test(label.textContent.trim())) continue;
+      const text = value.textContent.trim().replace(/\u2212/g, "-");
+      // Accept a standalone signed number with optional grouping separators.
+      if (!/^[+-]?(?:\d+|\d{1,3}(?:[,\s\u00a0\u202f]\d{3})+)(?:\.\d+)?$/.test(text)) continue;
+      const number = Number(text.replace(/[,\s\u00a0\u202f]/g, ""));
+      if (Number.isFinite(number)) reputation = number;
+      break;
+    }
+    const alignment = hero !== villain ? (hero ? "hero" : "villain") :
+      reputation > 0 ? "hero" : reputation < 0 ? "villain" : null;
+    return alignment ? { alignment, reputation } : null;
+  }
+
+  function savePlayerAlignment(profileUrl, data) {
+    const previous = readPlayerAlignment(profileUrl);
+    // Pre-cache payout records may have been inferred using the selected theme.
+    if (!previous || previous.alignment !== data.alignment) {
+      const controls = readControlState();
+      Object.keys(controls.districts).forEach((district) => {
+        if (controls.districts[district]?.source === "wire-payout") delete controls.districts[district];
+      });
+      writeControlState(controls);
+    }
+    localStorage.setItem(ALIGNMENT_STORE_KEY, JSON.stringify({
+      profile: profileUrl.pathname,
+      alignment: data.alignment,
+      reputation: data.reputation,
+      updatedAt: Date.now(),
+    }));
+  }
+
+  async function initializePlayerAlignment() {
+    const profileUrl = getOwnProfileUrl();
+    if (!profileUrl) return;
+    try {
+      if (location.pathname.replace(/\/$/, "") === profileUrl.pathname) {
+        // Natural visits refresh the cache without making a background request.
+        const data = parseProfileAlignment(document);
+        if (data) savePlayerAlignment(profileUrl, data);
+        return;
+      }
+      if (readPlayerAlignment(profileUrl)) return;
+
+      // One attempt on this page, only while uncached. Never follow a redirect
+      // to login/macro checks, submit a challenge, or retry in the render loop.
+      const response = await fetch(profileUrl.href, {
+        method: "GET",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { Accept: "text/html" },
+      });
+      if (!response.ok || !/text\/html/i.test(response.headers.get("content-type") || "")) return;
+      const profile = new DOMParser().parseFromString(await response.text(), "text/html");
+      // A challenge/error response without profile content cannot populate cache.
+      if (!profile.querySelector(".pf-wrap")) return;
+      const data = parseProfileAlignment(profile);
+      if (!data || getOwnProfileUrl()?.pathname !== profileUrl.pathname) return;
+      // Prefer a natural visit/newer result saved by another tab during the request.
+      if (!readPlayerAlignment(profileUrl)) savePlayerAlignment(profileUrl, data);
+      scanBoardNotes();
+      render(loadJob());
+    } catch (error) {
+      console.warn("Wire HUD: profile alignment unavailable; visit your own profile to refresh it.", error);
+    }
   }
 
   function readControlState() {
@@ -1127,6 +1229,7 @@
   }
 
   function start() {
+    void initializePlayerAlignment();
     if (!menuCommandBound && typeof GM_registerMenuCommand === "function") {
       menuCommandBound = true;
       GM_registerMenuCommand("Copy Wire job roster", () => exportRoster());
