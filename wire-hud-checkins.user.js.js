@@ -1,0 +1,1269 @@
+// ==UserScript==
+// @name         Masked City Wire HUD Check-Ins
+// @namespace    https://maskedcity.com/
+// @version      1.0.11
+// @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
+// @author       lvl11evelyn
+// @match        https://maskedcity.com/*
+// @match        https://www.maskedcity.com/*
+// @updateURL    https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
+// @downloadURL  https://github.com/lvl11evelyn/mc-wiretimers/raw/refs/heads/main/wire-hud-checkins.user.js
+// @run-at       document-idle
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const STORE_KEY = "wireHudCheckins:v1";
+  const NOTE_STORE_KEY = "wireHudNotes:v1";
+  const CONTROL_STORE_KEY = "wireHudDistrictControl:v1";
+  const PENDING_NOTE_KEY = "wireHudPendingNote:v1";
+  const ALIGNMENT_STORE_KEY = "wireHudPlayerAlignment:v1";
+  const TICK_MS = 1000;
+  const FEED_SCAN_MS = 30000;
+  const PAYOUT_RATIO_TOLERANCE = 0.025;
+  // Known Hero-aligned Wire titles. Villain-side mirror titles may differ and
+  // are still learned locally from the board when encountered.
+  const KNOWN_JOB_STARS = {
+    "Armored Truck Ambush": 4,
+    "Auction House": 4,
+    "Back Office Job": 3,
+    "Bank Siege": 4,
+    "Bolt Cutters": 1,
+    "Buyer and Seller": 2,
+    "Chop Shop": 2,
+    "Citywide Blackout": 5,
+    "Cloned Badge": 3,
+    "Collection Day": 2,
+    "Convoy Split": 4,
+    "Dispensary Raid": 3,
+    "Evidence Room": 4,
+    "Hijacked Load": 3,
+    "Machine Ripped Out": 2,
+    "Night Shift": 2,
+    "Penthouse Job": 4,
+    "Petty Theft Call": 1,
+    "Porch Pirates": 1,
+    "Protection Racket": 3,
+    "Robbery in Progress": 2,
+    "Second-Story Man": 2,
+    "Site Security": 1,
+    "Skimmer Sweep": 2,
+    "Smash and Grab": 3,
+    "Snatch and Run": 1,
+    "Someone Is Watching": 3,
+    "Stop the Train": 5,
+    "The Bullion Run": 5,
+    "The Count Room": 4,
+    "The Crown Job": 5,
+    "The Federal Transfer": 5,
+    "The Loan Exhibit": 4,
+    "The Tower Job": 5,
+    "The Vault": 5,
+    "Till Jumper": 1,
+    "Under the Car": 1,
+    "Walk-Out": 1,
+    "War in the Street": 5,
+    "Working the Gala": 3,
+  };
+
+  let timerId = null;
+  let lastFeedScanAt = 0;
+  let answerClickListenerBound = false;
+  let menuCommandBound = false;
+  let boardObserver = null;
+  let boardScanQueued = false;
+  const submittingCheckins = new Set();
+
+  function readNumber(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+
+  function getExpectedCheckins(stars) {
+    return stars >= 4 ? 2 : 1;
+  }
+
+  function normalizeDistrict(value) {
+    const slug = String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/^the\s+/, "")
+      .replace(/[_\s]+/g, "-");
+
+    const names = {
+      downtown: "Downtown",
+      heights: "Heights",
+      industrial: "Industrial",
+      "mid-city": "Mid-City",
+      midcity: "Mid-City",
+      slums: "Slums",
+    };
+
+    return names[slug] || String(value || "").trim();
+  }
+
+  function abbreviateDistrict(value) {
+    const district = normalizeDistrict(value);
+    const abbreviations = {
+      Downtown: "D",
+      Heights: "H",
+      Industrial: "I",
+      "Mid-City": "M",
+      Slums: "S",
+    };
+
+    return abbreviations[district] || district;
+  }
+
+  function getOwnProfileUrl() {
+    const href = document.querySelector("aside.v2-left .v2-me__name a[href]")?.getAttribute("href");
+    if (!href) return null;
+    try {
+      const url = new URL(href, location.origin);
+      if (url.origin !== location.origin || !/^\/profile\/\d+\/?$/.test(url.pathname)) return null;
+      url.pathname = url.pathname.replace(/\/$/, "");
+      url.search = "";
+      url.hash = "";
+      return url;
+    } catch {
+      return null;
+    }
+  }
+
+  function readPlayerAlignment(profileUrl = getOwnProfileUrl()) {
+    if (!profileUrl) return null;
+    try {
+      const state = JSON.parse(localStorage.getItem(ALIGNMENT_STORE_KEY) || "null");
+      return state?.profile === profileUrl.pathname &&
+        (state.alignment === "hero" || state.alignment === "villain") ? state : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getPlayerAlignment() {
+    return readPlayerAlignment()?.alignment || null;
+  }
+
+  function parseProfileAlignment(root) {
+    // Use semantic profile data, never theme, stat color, or rank/title text.
+    const chips = root.querySelectorAll(".pf-chips .pf-chip");
+    const hero = Array.from(chips).some((chip) => chip.classList.contains("pf-chip--hero"));
+    const villain = Array.from(chips).some((chip) => chip.classList.contains("pf-chip--villain"));
+    let reputation = null;
+    for (const row of root.querySelectorAll(".lr-kv")) {
+      const value = row.querySelector(".lr-kv__v");
+      if (!value) continue;
+      const label = row.cloneNode(true);
+      label.querySelectorAll(".lr-kv__v").forEach((node) => node.remove());
+      if (!/^reputation\s*:?$/i.test(label.textContent.trim())) continue;
+      const text = value.textContent.trim().replace(/\u2212/g, "-");
+      // Accept a standalone signed number with optional grouping separators.
+      if (!/^[+-]?(?:\d+|\d{1,3}(?:[,\s\u00a0\u202f]\d{3})+)(?:\.\d+)?$/.test(text)) continue;
+      const number = Number(text.replace(/[,\s\u00a0\u202f]/g, ""));
+      if (Number.isFinite(number)) reputation = number;
+      break;
+    }
+    const alignment = hero !== villain ? (hero ? "hero" : "villain") :
+      reputation > 0 ? "hero" : reputation < 0 ? "villain" : null;
+    return alignment ? { alignment, reputation } : null;
+  }
+
+  function savePlayerAlignment(profileUrl, data) {
+    const previous = readPlayerAlignment(profileUrl);
+    // Pre-cache payout records may have been inferred using the selected theme.
+    if (!previous || previous.alignment !== data.alignment) {
+      const controls = readControlState();
+      Object.keys(controls.districts).forEach((district) => {
+        if (controls.districts[district]?.source === "wire-payout") delete controls.districts[district];
+      });
+      writeControlState(controls);
+    }
+    localStorage.setItem(ALIGNMENT_STORE_KEY, JSON.stringify({
+      profile: profileUrl.pathname,
+      alignment: data.alignment,
+      reputation: data.reputation,
+      updatedAt: Date.now(),
+    }));
+  }
+
+  async function initializePlayerAlignment() {
+    const profileUrl = getOwnProfileUrl();
+    if (!profileUrl) return;
+    try {
+      if (location.pathname.replace(/\/$/, "") === profileUrl.pathname) {
+        // Natural visits refresh the cache without making a background request.
+        const data = parseProfileAlignment(document);
+        if (data) savePlayerAlignment(profileUrl, data);
+        return;
+      }
+      if (readPlayerAlignment(profileUrl)) return;
+
+      // One attempt on this page, only while uncached. Never follow a redirect
+      // to login/macro checks, submit a challenge, or retry in the render loop.
+      const response = await fetch(profileUrl.href, {
+        method: "GET",
+        credentials: "same-origin",
+        redirect: "error",
+        headers: { Accept: "text/html" },
+      });
+      if (!response.ok || !/text\/html/i.test(response.headers.get("content-type") || "")) return;
+      const profile = new DOMParser().parseFromString(await response.text(), "text/html");
+      // A challenge/error response without profile content cannot populate cache.
+      if (!profile.querySelector(".pf-wrap")) return;
+      const data = parseProfileAlignment(profile);
+      if (!data || getOwnProfileUrl()?.pathname !== profileUrl.pathname) return;
+      // Prefer a natural visit/newer result saved by another tab during the request.
+      if (!readPlayerAlignment(profileUrl)) savePlayerAlignment(profileUrl, data);
+      scanBoardNotes();
+      render(loadJob());
+    } catch (error) {
+      console.warn("Wire HUD: profile alignment unavailable; visit your own profile to refresh it.", error);
+    }
+  }
+
+  function readControlState() {
+    try {
+      const state = JSON.parse(localStorage.getItem(CONTROL_STORE_KEY) || "null");
+      return state && state.districts ? state : { authorityAt: 0, districts: {} };
+    } catch {
+      localStorage.removeItem(CONTROL_STORE_KEY);
+      return { authorityAt: 0, districts: {} };
+    }
+  }
+
+  function writeControlState(state) {
+    localStorage.setItem(CONTROL_STORE_KEY, JSON.stringify(state));
+  }
+
+  function buildControlRecord({ district, heroPct, villainPct, controller, status, source, at }) {
+    const hero = readNumber(heroPct);
+    const villain = readNumber(villainPct);
+    const normalizedStatus = status === "siege" ? "siege" : "controlled";
+
+    return {
+      district: normalizeDistrict(district),
+      heroPct: hero,
+      villainPct: villain,
+      controller: controller === "hero" || controller === "villain" ? controller : null,
+      status: normalizedStatus,
+      source,
+      updatedAt: at || Date.now(),
+    };
+  }
+
+  function saveAuthorityRecords(records, source) {
+    if (!records.length) return;
+
+    const state = readControlState();
+    const now = Date.now();
+    state.authorityAt = now;
+
+    records.forEach((record) => {
+      state.districts[normalizeDistrict(record.district)] = {
+        ...record,
+        source,
+        updatedAt: now,
+      };
+    });
+
+    writeControlState(state);
+  }
+
+  function getDistrictControl(district) {
+    return readControlState().districts[normalizeDistrict(district)] || null;
+  }
+
+  function classifyDistrict(control) {
+    if (!control) return "";
+
+    if (control.controller === "hero") return "🛡️";
+    if (control.controller === "villain") return "🏴‍☠️";
+    if (control.status === "siege") return "⚔️";
+    return "";
+  }
+
+  function getControlKind(control) {
+    if (!control) return "";
+    if (control.controller === "hero") return "hero";
+    if (control.controller === "villain") return "villain";
+    if (control.status === "siege" || control.controller === null) return "uncontrolled";
+    return "";
+  }
+
+  function getControlIcon(kind) {
+    if (kind === "hero") return "🛡️";
+    if (kind === "villain") return "🏴‍☠️";
+    if (kind === "uncontrolled") return "⚔️";
+    return "";
+  }
+
+  function getControlClass(kind) {
+    if (kind === "hero") return "h_c";
+    if (kind === "villain") return "v_c";
+    if (kind === "uncontrolled") return "u_c";
+    return "";
+  }
+
+  function relationToControlKind(relation) {
+    const alignment = getPlayerAlignment();
+    if (relation === "base") return "uncontrolled";
+    if (!alignment) return "";
+
+    if (relation === "friendly") return alignment;
+    if (relation === "opposing") return alignment === "hero" ? "villain" : "hero";
+    return "";
+  }
+
+  function ratiosMatch(first, second, target) {
+    if (!Number.isFinite(first) || !Number.isFinite(second) || !target) return false;
+    return Math.abs(first - target) / target <= PAYOUT_RATIO_TOLERANCE &&
+      Math.abs(second - target) / target <= PAYOUT_RATIO_TOLERANCE;
+  }
+
+  function inferPayoutRelationship(lowNote, highNote) {
+    if (!lowNote?.low || !lowNote?.high || !highNote?.low || !highNote?.high) return null;
+
+    const lowRatio = highNote.low / lowNote.low;
+    const highRatio = highNote.high / lowNote.high;
+    const relationships = [
+      { ratio: 1.25, low: "base", high: "friendly" },
+      { ratio: 1 / 0.85, low: "opposing", high: "base" },
+      { ratio: 1.25 / 0.85, low: "opposing", high: "friendly" },
+    ];
+
+    return relationships.find((item) => ratiosMatch(lowRatio, highRatio, item.ratio)) || null;
+  }
+
+  function saveWireInferredControls(inferred) {
+    const entries = Object.entries(inferred || {}).filter(([, kind]) => kind);
+    if (!entries.length) return;
+
+    const state = readControlState();
+    entries.forEach(([district, kind]) => {
+      state.districts[normalizeDistrict(district)] = buildControlRecord({
+        district,
+        controller: kind === "hero" || kind === "villain" ? kind : null,
+        status: kind === "uncontrolled" ? "siege" : "controlled",
+        source: "wire-payout",
+      });
+    });
+    writeControlState(state);
+  }
+
+  function getNoteKey(note) {
+    return [note.title || "", note.district || "", note.minutes || ""]
+      .map((part) => String(part).trim().toLowerCase())
+      .join("|");
+  }
+
+  function readSavedNotes() {
+    try {
+      return JSON.parse(localStorage.getItem(NOTE_STORE_KEY) || "{}");
+    } catch {
+      localStorage.removeItem(NOTE_STORE_KEY);
+      return {};
+    }
+  }
+
+  function getSeededNotes() {
+    return Object.entries(KNOWN_JOB_STARS).map(([title, stars]) => ({ title, stars }));
+  }
+
+  function getKnownNotes() {
+    return getSeededNotes().concat(Object.values(readSavedNotes()));
+  }
+
+  function findKnownNoteByTitle(title) {
+    const normalizedTitle = String(title || "").trim().toLowerCase();
+    if (!normalizedTitle) return null;
+
+    const matches = getKnownNotes().filter((note) => {
+      return String(note.title || "").trim().toLowerCase() === normalizedTitle && note.stars;
+    });
+
+    const starCounts = new Set(matches.map((note) => note.stars));
+    return starCounts.size === 1 ? matches[0] : null;
+  }
+
+  function buildRosterExport() {
+    const byTitle = new Map();
+
+    getKnownNotes().forEach((note) => {
+      const title = String(note.title || "").trim();
+      if (!title || !note.stars) return;
+
+      if (!byTitle.has(title)) byTitle.set(title, new Set());
+      byTitle.get(title).add(note.stars);
+    });
+
+    return Array.from(byTitle.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([title, stars]) => {
+        const values = Array.from(stars).sort((a, b) => a - b);
+        return `${title}: ${values.join("/")}★`;
+      })
+      .join("\n");
+  }
+
+  function copyText(text) {
+    if (typeof GM_setClipboard === "function") {
+      GM_setClipboard(text, "text");
+      return Promise.resolve();
+    }
+
+    if (navigator.clipboard?.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const copied = document.execCommand("copy");
+    textarea.remove();
+    return copied ? Promise.resolve() : Promise.reject(new Error("Copy failed"));
+  }
+
+  function exportRoster(button = null) {
+    const text = buildRosterExport() || "No Wire board jobs have been learned yet.";
+    copyText(text)
+      .then(() => {
+        if (!button) {
+          console.info("Wire job roster copied.");
+          return;
+        }
+      })
+      .catch(() => {
+        console.warn("Wire job roster copy failed.");
+      });
+  }
+
+  function readStoredJob() {
+    try {
+      return JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+    } catch {
+      localStorage.removeItem(STORE_KEY);
+      return null;
+    }
+  }
+
+  function writeStoredJob(job) {
+    localStorage.setItem(STORE_KEY, JSON.stringify(job));
+  }
+
+  function readPendingNote() {
+    try {
+      return JSON.parse(sessionStorage.getItem(PENDING_NOTE_KEY) || "null");
+    } catch {
+      sessionStorage.removeItem(PENDING_NOTE_KEY);
+      return null;
+    }
+  }
+
+  function writePendingNote(note) {
+    sessionStorage.setItem(PENDING_NOTE_KEY, JSON.stringify(note));
+  }
+
+  function scanBoardNotes() {
+    const notes = Array.from(document.querySelectorAll(".wb-note[data-stars][data-district]"));
+    if (!notes.length) return;
+
+    ensureStyles();
+
+    const saved = readSavedNotes();
+    const controlState = readControlState();
+    const directByDistrict = {};
+    const inferredByDistrict = {};
+    const noteRecords = [];
+
+    notes.forEach((node) => {
+      const note = {
+        id: node.dataset.wbNote || "",
+        title: node.dataset.title || node.querySelector(".wb-note__title")?.textContent?.trim() || "",
+        district: node.dataset.district || "",
+        stars: readNumber(node.dataset.stars),
+        minutes: readNumber(node.dataset.minutes),
+        low: readNumber(node.dataset.low),
+        high: readNumber(node.dataset.high),
+        node,
+      };
+
+      if (!note.district || !note.stars || !note.minutes) return;
+      saved[getNoteKey(note)] = {
+        id: note.id,
+        title: note.title,
+        district: note.district,
+        stars: note.stars,
+        minutes: note.minutes,
+        low: note.low,
+        high: note.high,
+      };
+      noteRecords.push(note);
+
+      const district = normalizeDistrict(note.district);
+      const directKind = getControlKind(controlState.districts[district]);
+      if (directKind) directByDistrict[district] = directKind;
+
+      if (!node.dataset.wireHudClickBound) {
+        node.dataset.wireHudClickBound = "1";
+        node.addEventListener("click", () => writePendingNote(saved[getNoteKey(note)]), { passive: true });
+      }
+    });
+
+    inferBoardDistrictControls(noteRecords, inferredByDistrict);
+    saveWireInferredControls(inferredByDistrict);
+    annotateBoardNotes(noteRecords, inferredByDistrict, directByDistrict);
+    localStorage.setItem(NOTE_STORE_KEY, JSON.stringify(saved));
+  }
+
+  function inferBoardDistrictControls(notes, inferredByDistrict) {
+    const byStars = new Map();
+
+    notes.forEach((note) => {
+      if (!note.stars || !note.low || !note.high) return;
+      if (!byStars.has(note.stars)) byStars.set(note.stars, []);
+      byStars.get(note.stars).push(note);
+    });
+
+    byStars.forEach((starNotes) => {
+      for (let index = 0; index < starNotes.length; index += 1) {
+        for (let compareIndex = index + 1; compareIndex < starNotes.length; compareIndex += 1) {
+          const first = starNotes[index];
+          const second = starNotes[compareIndex];
+          if (normalizeDistrict(first.district) === normalizeDistrict(second.district)) continue;
+
+          const ordered = first.low <= second.low ? [first, second] : [second, first];
+          const relationship = inferPayoutRelationship(ordered[0], ordered[1]);
+          if (!relationship) continue;
+
+          const lowKind = relationToControlKind(relationship.low);
+          const highKind = relationToControlKind(relationship.high);
+          setInferredDistrictKind(inferredByDistrict, ordered[0].district, lowKind);
+          setInferredDistrictKind(inferredByDistrict, ordered[1].district, highKind);
+        }
+      }
+    });
+  }
+
+  function setInferredDistrictKind(inferredByDistrict, district, kind) {
+    if (!kind) return;
+
+    const normalizedDistrict = normalizeDistrict(district);
+    const existing = inferredByDistrict[normalizedDistrict];
+    inferredByDistrict[normalizedDistrict] = existing && existing !== kind ? "" : kind;
+  }
+
+  function annotateBoardNotes(notes, inferredByDistrict, directByDistrict) {
+    notes.forEach((note) => {
+      const district = normalizeDistrict(note.district);
+      const kind = inferredByDistrict[district] || directByDistrict[district] || "";
+      const icon = getControlIcon(kind);
+      const controlClass = getControlClass(kind);
+
+      note.node.classList.remove("h_c", "v_c", "u_c");
+      if (controlClass) note.node.classList.add(controlClass);
+
+      const existing = note.node.querySelector(".wire-note-control");
+      if (!icon) {
+        existing?.remove();
+        return;
+      }
+
+      const label = kind === "hero" ? "Hero controlled" : kind === "villain" ? "Villain controlled" : "Contested";
+      const marker = existing || document.createElement("span");
+      marker.className = "wire-note-control";
+      marker.textContent = icon;
+      marker.title = label;
+      marker.setAttribute("aria-label", label);
+
+      const meta = note.node.querySelector(".wb-note__meta");
+      const districtLabel = meta?.firstElementChild;
+      const target = meta || note.node.querySelector(".wb-note__body") || note.node;
+
+      if (districtLabel) {
+        if (marker.parentElement !== target || marker.nextElementSibling !== districtLabel) {
+          target.insertBefore(marker, districtLabel);
+        }
+      } else if (!existing) {
+        target.appendChild(marker);
+      }
+    });
+  }
+
+  function scanCityDistricts() {
+    const records = Array.from(document.querySelectorAll(".district-panel")).map((panel) => {
+      const district = normalizeDistrict(panel.querySelector(".district-name")?.textContent || "");
+      const title = panel.querySelector(".district-war")?.getAttribute("title") || "";
+      const owner = panel.querySelector(".district-war-owner")?.textContent?.trim()?.toLowerCase();
+      const match = title.match(/(\d+)%\s*Hero\s*\/\s*(\d+)%\s*Villain(?:\s*—\s*(Hero|Villain)\s+controlled)?/i);
+
+      if (!district || !match) return null;
+
+      return buildControlRecord({
+        district,
+        heroPct: match[1],
+        villainPct: match[2],
+        controller: owner === "hero" || owner === "villain" ? owner : match[3]?.toLowerCase() || null,
+        status: panel.classList.contains("is-siege") || /siege/i.test(title) ? "siege" : "controlled",
+        source: "city",
+      });
+    }).filter(Boolean);
+
+    saveAuthorityRecords(records, "city");
+  }
+
+  function scanWatchtowerDistricts() {
+    const records = Array.from(document.querySelectorAll(".wt-cell[data-district]")).map((cell) => {
+      const controller = cell.querySelector(".wt-cell__who")?.textContent?.trim()?.toLowerCase();
+
+      return buildControlRecord({
+        district: cell.dataset.district,
+        controller: controller === "hero" || controller === "villain" ? controller : null,
+        status: cell.classList.contains("wt-cell--siege") || /siege/i.test(cell.textContent) || /siege/i.test(cell.title) ? "siege" : "controlled",
+        source: "watchtower",
+      });
+    }).filter(Boolean);
+
+    saveAuthorityRecords(records, "watchtower");
+  }
+
+  function parseRelativeTime(text) {
+    const value = String(text || "").trim().toLowerCase();
+    if (!value || value.includes("just now")) return Date.now();
+
+    const match = value.match(/(\d+)\s*(m|min|minute|minutes|h|hr|hour|hours|d|day|days)/);
+    if (!match) return null;
+
+    const amount = Number(match[1]);
+    const unit = match[2][0];
+    const scale = unit === "d" ? 86400000 : unit === "h" ? 3600000 : 60000;
+    return Date.now() - amount * scale;
+  }
+
+  function scanFeedEvents(force = false) {
+    const now = Date.now();
+    if (!force && now - lastFeedScanAt < FEED_SCAN_MS) return;
+    lastFeedScanAt = now;
+
+    const state = readControlState();
+    let changed = false;
+
+    document.querySelectorAll('.rs-feed-item[data-type="war"], .war-feed-item').forEach((item) => {
+      const text = item.querySelector(".rs-feed-text, .war-feed-item__text")?.textContent || item.textContent || "";
+      const siegeMatch = text.match(/([^.!]+?)\s+is\s+(?:now\s+)?under\s+siege/i);
+      const match = text.match(/The\s+(Heroes|Villains)\s+have\s+taken\s+([^!]+)!/i);
+      if (!match && !siegeMatch) return;
+
+      const eventAt = parseRelativeTime(item.querySelector(".rs-feed-time, .war-feed-item__time")?.textContent);
+      if (!eventAt || eventAt <= (state.authorityAt || 0)) return;
+
+      const district = normalizeDistrict(match ? match[2] : siegeMatch[1]);
+      const controller = match ? (match[1].toLowerCase().startsWith("hero") ? "hero" : "villain") : null;
+      const current = state.districts[district];
+      if (current && current.updatedAt >= eventAt) return;
+
+      state.districts[district] = buildControlRecord({
+        district,
+        controller: controller || current?.controller || null,
+        status: siegeMatch ? "siege" : "controlled",
+        source: "feed",
+        at: eventAt,
+      });
+      changed = true;
+    });
+
+    if (changed) writeControlState(state);
+  }
+
+  function findMatchingNote(job, checkins) {
+    const pending = readPendingNote();
+    const saved = readSavedNotes();
+    const minutes = Math.round((job.ends - job.starts) / 60000);
+    const base = {
+      title: job.querySelector(".wb-job__title")?.textContent?.trim() || "",
+      district: job.querySelector(".wb-bar__k")?.textContent?.trim() || "",
+      minutes,
+    };
+
+    if (
+      pending &&
+      pending.district === base.district &&
+      pending.minutes === minutes &&
+      (!pending.title || !base.title || pending.title === base.title)
+    ) {
+      return pending;
+    }
+
+    const exact = saved[getNoteKey(base)];
+    if (exact) return exact;
+
+    const titleMatch = findKnownNoteByTitle(base.title);
+    if (titleMatch) return titleMatch;
+
+    return Object.values(saved).find((note) => {
+      return note.district === base.district && note.minutes === minutes && getExpectedCheckins(note.stars) === checkins.length;
+    }) || null;
+  }
+
+  function hydrateJobMetadata(job) {
+    if (!job) return job;
+
+    const saved = readSavedNotes();
+    const notes = Object.values(saved);
+    const checkinCount = (job.checkins || []).length;
+    const district = normalizeDistrict(job.district);
+    const minutes = readNumber(job.minutes) || Math.round((job.ends - job.starts) / 60000);
+    const title = String(job.title || "").trim();
+
+    const exactNote = notes.find((item) => item.title === title && normalizeDistrict(item.district) === district && item.minutes === minutes);
+    const titleNote = findKnownNoteByTitle(title);
+    const timingNote = notes.find((item) => normalizeDistrict(item.district) === district && item.minutes === minutes && getExpectedCheckins(item.stars) === checkinCount);
+    const note = exactNote || titleNote || timingNote;
+
+    if (!note) return job;
+
+    return {
+      ...job,
+      district: job.district || note.district,
+      stars: note.stars || job.stars,
+      minutes: note.minutes || job.minutes,
+      low: exactNote || timingNote ? note.low || job.low : job.low,
+      high: exactNote || timingNote ? note.high || job.high : job.high,
+    };
+  }
+
+  function readJobFromPage() {
+    const job = document.querySelector(".wb-job[data-starts][data-ends]");
+    if (!job) return null;
+
+    const storedJob = readStoredJob();
+    const starts = Number(job.dataset.starts);
+    const ends = Number(job.dataset.ends);
+    const checkins = Array.from(job.querySelectorAll(".wb-checkin[data-at]"))
+      .slice(0, 2)
+      .map((node, index) => {
+        const checkinIndex = readNumber(node.dataset.wbCheckin);
+        const itemIndex = checkinIndex === null ? index + 1 : checkinIndex + 1;
+        const at = Number(node.dataset.at);
+        const state = node.dataset.state || "waiting";
+        const existing = storedJob?.checkins?.find((item) => item.index === itemIndex || item.at === at);
+        const answeredAt = state === "answered" ? existing?.answeredAt || Date.now() : existing?.answeredAt || null;
+
+        return {
+          index: itemIndex,
+          at,
+          state,
+          answeredAt,
+        };
+      })
+      .filter((item) => Number.isFinite(item.at));
+
+    if (!Number.isFinite(starts) || !Number.isFinite(ends) || !checkins.length) {
+      return null;
+    }
+
+    const note = findMatchingNote(job, checkins);
+    const fallbackDistrict = job.querySelector(".wb-bar__k")?.textContent?.trim() || "";
+
+    return {
+      title: job.querySelector(".wb-job__title")?.textContent?.trim() || "Wire Task",
+      district: fallbackDistrict || note?.district || "",
+      stars: note?.stars || null,
+      minutes: note?.minutes || Math.round((ends - starts) / 60000),
+      low: note?.low || null,
+      high: note?.high || null,
+      starts,
+      ends,
+      checkins,
+    };
+  }
+
+  function loadJob() {
+    const pageJob = readJobFromPage();
+    if (pageJob) {
+      writeStoredJob(pageJob);
+      return pageJob;
+    }
+
+    const storedJob = hydrateJobMetadata(readStoredJob());
+    if (storedJob) writeStoredJob(storedJob);
+    return storedJob;
+  }
+
+  function markCheckinAnswered(answerIndex) {
+    const job = loadJob();
+    if (!job?.checkins?.length) return;
+
+    const targetIndex = Number(answerIndex) + 1;
+    let changed = false;
+
+    job.checkins = job.checkins.map((item) => {
+      if (item.index !== targetIndex || item.answeredAt) return item;
+      changed = true;
+      return {
+        ...item,
+        state: "answered",
+        answeredAt: Date.now(),
+      };
+    });
+
+    if (changed) {
+      writeStoredJob(job);
+      render(job);
+    }
+  }
+
+  function goToWire() {
+    window.location.assign("/wire");
+  }
+
+  function getCsrfToken() {
+    const field = document.querySelector('input[name="csrf_token"], input[name="_csrf"], meta[name="csrf-token"]');
+    const fieldToken = field?.value || field?.content;
+    if (fieldToken) return fieldToken;
+
+    const cookie = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("mc.csrf="));
+
+    return cookie ? decodeURIComponent(cookie.slice("mc.csrf=".length)) : "";
+  }
+
+  async function submitHudCheckin(answerIndex) {
+    const normalizedIndex = Number(answerIndex);
+    if (!Number.isInteger(normalizedIndex) || normalizedIndex < 0) {
+      goToWire();
+      return;
+    }
+
+    if (submittingCheckins.has(normalizedIndex)) return;
+    submittingCheckins.add(normalizedIndex);
+
+    const token = getCsrfToken();
+    if (!token) {
+      goToWire();
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const response = await fetch("/wire/check-in", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+        body: new URLSearchParams({
+          csrf_token: token,
+          index: String(normalizedIndex),
+        }),
+        signal: controller.signal,
+      });
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok || !contentType.includes("application/json")) {
+        goToWire();
+        return;
+      }
+
+      const data = await response.json();
+      if (!data || data.ok !== true) {
+        goToWire();
+        return;
+      }
+
+      markCheckinAnswered(normalizedIndex);
+    } catch {
+      goToWire();
+    } finally {
+      window.clearTimeout(timeoutId);
+      submittingCheckins.delete(normalizedIndex);
+    }
+  }
+
+  function clearJob() {
+    localStorage.removeItem(STORE_KEY);
+    document.querySelector(".wire-hud")?.remove();
+  }
+
+  function formatRemaining(ms) {
+    const total = Math.max(0, Math.ceil(ms / 1000));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+    }
+
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function clamp(number, min, max) {
+    return Math.min(max, Math.max(min, number));
+  }
+
+  function mixChannel(start, end, percent) {
+    return Math.round(start + (end - start) * percent);
+  }
+
+  function mixColor(start, end, percent) {
+    const amount = clamp(percent, 0, 1);
+    return `rgb(${mixChannel(start[0], end[0], amount)}, ${mixChannel(start[1], end[1], amount)}, ${mixChannel(start[2], end[2], amount)})`;
+  }
+
+  function getLateColor(startedAt, endsAt, now) {
+    const lateWindow = Math.max(1, endsAt - startedAt);
+    const latePercent = clamp((now - startedAt) / lateWindow, 0, 1);
+    return mixColor([255, 155, 176], [255, 0, 0], latePercent);
+  }
+
+  function ensureStyles() {
+    if (document.getElementById("wireHudStyles")) return;
+
+    const style = document.createElement("style");
+    style.id = "wireHudStyles";
+    style.textContent = `
+      .wire-hud {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 190px;
+        max-width: 340px;
+        padding: 5px 8px;
+        border: 1px solid rgba(95, 180, 255, 0.28);
+        background: rgba(8, 13, 24, 0.78);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04), 0 0 14px rgba(26, 147, 255, 0.14);
+        color: var(--on-accent) !important;
+        font-family: var(--font-ui);
+        font-size: 13px;
+        font-weight: 400;
+        line-height: 1;
+        text-transform: uppercase;
+      }
+
+      .wire-hud__list {
+        display: grid;
+        gap: 3px;
+        width: 100%;
+      }
+
+      .wire-hud__row {
+        display: grid;
+        grid-template-columns: max-content minmax(64px, 1fr) max-content;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+      }
+
+      .wire-hud__link,
+      .v2-nav a.wire-hud__link {
+        display: block;
+        flex: none;
+        min-width: 0;
+        max-width: none;
+        width: 100%;
+        height: auto;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        letter-spacing: inherit;
+        white-space: inherit;
+        text-decoration: none;
+        transition: none;
+        cursor: pointer;
+      }
+
+      .wire-hud__link:hover .wire-hud__label,
+      .wire-hud__link:hover .wire-hud__time {
+        text-decoration: underline;
+      }
+
+      .wire-hud__row--task {
+        grid-template-columns: max-content minmax(64px, 1fr) max-content;
+      }
+
+      .wire-hud__label {
+        color: #94caff;
+      }
+
+      .wire-hud__track {
+        height: 8px;
+        overflow: hidden;
+        background: rgba(255,255,255,0.13);
+        border: 1px solid rgba(255,255,255,0.12);
+      }
+
+      .wire-hud__fill {
+        width: 0%;
+        height: 100%;
+        display: block;
+        background: linear-gradient(90deg, #20e3ff, #ffd43b);
+        transition: width 220ms linear;
+      }
+
+      .wire-hud__time {
+        min-width: 38px;
+        text-align: right;
+        color: #fff;
+      }
+
+      .wire-hud__row--task .wire-hud__label {
+        color: #ffd86b;
+      }
+
+      .wire-hud__row--task .wire-hud__fill {
+        background: linear-gradient(90deg, #ffb020, #20e3ff);
+      }
+
+      .wire-hud__row.is-late .wire-hud__fill {
+        width: 100%;
+        background: var(--wire-late-color, #ff9bb0);
+      }
+
+      .wire-hud__row.is-late .wire-hud__time {
+        color: var(--wire-late-color, #ff9bb0);
+      }
+
+      .wire-hud__row.is-answered .wire-hud__fill {
+        width: 100%;
+        background: #6f7782;
+      }
+
+      .wire-hud__row.is-answered .wire-hud__label,
+      .wire-hud__row.is-answered .wire-hud__time {
+        color: #6f7782;
+      }
+
+      .wire-note-control {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        margin-right: 4px;
+        line-height: 1;
+        transform: scale(1.6);
+        filter: drop-shadow(1px 1px 1px #0008) drop-shadow(1px 1px 0px #000);
+      }
+
+      .wb-note.h_c {
+        filter: drop-shadow(2px 2px 4px #88f);
+      }
+
+      .wb-note.h_c .wb-note__body {
+        background: #88f1;
+        box-shadow: 0 0 4px 6px #88f1;
+        border-radius: 3px;
+      }
+
+      .wb-note.v_c {
+        filter: drop-shadow(2px 2px 4px #f88);
+      }
+
+      .wb-note.v_c .wb-note__body {
+        background: #f881;
+        box-shadow: 0 0 4px 6px #f881;
+        border-radius: 3px;
+      }
+
+      .wb-note.u_c {
+        filter: drop-shadow(2px 2px 4px #111);
+      }
+
+      .wb-note.u_c .wb-note__body {
+        background: #1111;
+        box-shadow: 0 0 4px 6px #1111;
+        border-radius: 3px;
+      }
+
+      @media (max-width: 980px) {
+        .wire-hud {
+          display: none;
+        }
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  function ensureHud() {
+    const wireAnchor = document.querySelector('nav.v2-nav a[href="/wire"]');
+    if (wireAnchor) {
+      ensureStyles();
+
+      let widget = document.querySelector(".wire-hud");
+      if (!widget) {
+        widget = document.createElement("div");
+        widget.className = "wire-hud";
+        widget.setAttribute("aria-live", "polite");
+        widget.innerHTML = '<div class="wire-hud__list"></div>';
+      }
+
+      if (wireAnchor.nextElementSibling !== widget) {
+        wireAnchor.after(widget);
+      }
+
+      return widget;
+    }
+
+    const hud = document.querySelector("header.hud");
+    if (!hud) return null;
+
+    let widget = document.querySelector(".wire-hud");
+    if (widget) return widget;
+
+    ensureStyles();
+    widget = document.createElement("div");
+    widget.className = "wire-hud";
+    widget.setAttribute("aria-live", "polite");
+    widget.innerHTML = '<div class="wire-hud__list"></div>';
+
+    const ident = hud.querySelector(".ident");
+    hud.insertBefore(widget, ident || hud.querySelector(".hud__tools") || null);
+    return widget;
+  }
+
+  function queueBoardScan() {
+    if (boardScanQueued) return;
+    boardScanQueued = true;
+
+    window.setTimeout(() => {
+      boardScanQueued = false;
+      scanBoardNotes();
+    }, 50);
+  }
+
+  function observeBoardNotes() {
+    if (boardObserver) return;
+
+    const board = document.querySelector("#wbGrid, .wb-grid, .wb-board");
+    if (!board) return;
+
+    boardObserver = new MutationObserver((mutations) => {
+      if (!mutations.some((mutation) => mutation.type === "childList")) return;
+      queueBoardScan();
+    });
+    boardObserver.observe(board, { childList: true, subtree: true });
+  }
+
+  function render(job) {
+    const now = Date.now();
+    scanFeedEvents();
+
+    if (!job || !Number.isFinite(job.ends) || now >= job.ends) {
+      clearJob();
+      return;
+    }
+
+    const widget = ensureHud();
+    if (!widget) return;
+
+    const list = widget.querySelector(".wire-hud__list");
+    const stars = readNumber(job.stars);
+    const expectedCheckins = stars ? getExpectedCheckins(stars) : 2;
+    const activeCheckins = (job.checkins || [])
+      .slice(0, expectedCheckins)
+      .filter((item) => Number.isFinite(item.at) && item.at <= job.ends);
+
+    if (!activeCheckins.length) {
+      clearJob();
+      return;
+    }
+
+    const checkinRows = activeCheckins.map((item) => {
+        const ready = now >= item.at;
+        const answered = Number.isFinite(item.answeredAt);
+        const total = Math.max(1, item.at - job.starts);
+        const elapsed = Math.max(0, Math.min(total, now - job.starts));
+        const percent = ready ? 100 : (elapsed / total) * 100;
+        const label = `Check-In #${item.index}:`;
+        const readyElapsed = (answered ? item.answeredAt : now) - item.at;
+        const time = ready ? `+${formatRemaining(readyElapsed)}` : formatRemaining(item.at - now);
+        const lateColor = ready && !answered ? getLateColor(item.at, job.ends, now) : "";
+        const stateClass = answered ? " is-answered" : ready ? " is-late" : "";
+        const rowStyle = lateColor ? ` style="--wire-late-color:${lateColor}"` : "";
+        const row = `
+          <span class="wire-hud__row${stateClass}"${rowStyle}>
+            <span class="wire-hud__label">${label}</span>
+            <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${percent.toFixed(2)}%"></span></span>
+            <span class="wire-hud__time">${time}</span>
+          </span>
+        `;
+
+        return ready && !answered
+          ? `<a href="/wire" class="wire-hud__link" data-wire-hud-answer="${item.index - 1}" aria-label="${label} ready, answer Wire check-in">${row}</a>`
+          : `<div class="wire-hud__row${stateClass}"${rowStyle}>
+              <span class="wire-hud__label">${label}</span>
+              <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${percent.toFixed(2)}%"></span></span>
+              <span class="wire-hud__time">${time}</span>
+            </div>`;
+      });
+
+    const taskTotal = Math.max(1, job.ends - job.starts);
+    const taskElapsed = Math.max(0, Math.min(taskTotal, now - job.starts));
+    const taskPercent = (taskElapsed / taskTotal) * 100;
+    const controlLabel = classifyDistrict(getDistrictControl(job.district));
+    const fallbackStars = !stars && activeCheckins.length === 2 ? "4-5★" : "";
+    const taskLabel = [abbreviateDistrict(job.district), stars ? `${stars}★` : fallbackStars, controlLabel].filter(Boolean).join(" ") || "Wire Task";
+    const taskRow = `
+      <div class="wire-hud__row wire-hud__row--task">
+        <span class="wire-hud__label">${taskLabel}:</span>
+        <span class="wire-hud__track"><span class="wire-hud__fill" style="width:${taskPercent.toFixed(2)}%"></span></span>
+        <span class="wire-hud__time">${formatRemaining(job.ends - now)}</span>
+      </div>
+    `;
+
+    list.innerHTML = checkinRows.concat(taskRow).join("");
+  }
+
+  function start() {
+    void initializePlayerAlignment();
+    if (!menuCommandBound && typeof GM_registerMenuCommand === "function") {
+      menuCommandBound = true;
+      GM_registerMenuCommand("Copy Wire job roster", () => exportRoster());
+    }
+
+    if (!answerClickListenerBound) {
+      answerClickListenerBound = true;
+      document.addEventListener("click", (event) => {
+        const hudLink = event.target.closest("[data-wire-hud-answer]");
+        if (hudLink && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+          event.preventDefault();
+          submitHudCheckin(hudLink.dataset.wireHudAnswer);
+          return;
+        }
+
+        const button = event.target.closest("[data-wb-answer]");
+        if (button) markCheckinAnswered(button.dataset.wbAnswer);
+      }, true);
+    }
+
+    scanBoardNotes();
+    observeBoardNotes();
+    scanCityDistricts();
+    scanWatchtowerDistricts();
+    scanFeedEvents(true);
+    render(loadJob());
+
+    clearInterval(timerId);
+    timerId = setInterval(() => render(loadJob()), TICK_MS);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start, { once: true });
+  } else {
+    start();
+  }
+})();
