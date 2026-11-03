@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.13
+// @version      1.0.14
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -189,17 +189,28 @@
     }));
   }
 
+  let alignmentFetchAttempted = false;
+
+  function isOwnAlignmentPage(profileUrl) {
+    if (/^\/lair\/?$/.test(location.pathname)) return true;
+    const match = location.pathname.match(/^\/profile\/(\d+)\/?$/);
+    return !!match && match[1] === profileUrl.pathname.split("/").pop();
+  }
+
   async function initializePlayerAlignment() {
     const profileUrl = getOwnProfileUrl();
     if (!profileUrl) return;
     try {
-      if (location.pathname.replace(/\/$/, "") === profileUrl.pathname) {
+      if (isOwnAlignmentPage(profileUrl)) {
         // Natural visits refresh the cache without making a background request.
         const data = parseProfileAlignment(document);
-        if (data) savePlayerAlignment(profileUrl, data);
-        return;
+        if (data) {
+          savePlayerAlignment(profileUrl, data);
+          return;
+        }
       }
-      if (readPlayerAlignment(profileUrl)) return;
+      if (readPlayerAlignment(profileUrl) || alignmentFetchAttempted) return;
+      alignmentFetchAttempted = true;
 
       // One attempt on this page, only while uncached. Never follow a redirect
       // to login/macro checks, submit a challenge, or retry in the render loop.
@@ -220,7 +231,7 @@
       scanBoardNotes();
       render(loadJob());
     } catch (error) {
-      console.warn("Wire HUD: profile alignment unavailable; visit your own profile to refresh it.", error);
+      console.warn("Wire HUD: profile alignment unavailable; visit your own profile or Lair to refresh it.", error);
     }
   }
 
