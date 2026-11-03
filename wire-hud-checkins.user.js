@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.14
+// @version      1.0.15
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -118,18 +118,21 @@
   }
 
   function getOwnProfileUrl() {
-    const href = document.querySelector("aside.v2-left .v2-me__name a[href]")?.getAttribute("href");
-    if (!href) return null;
-    try {
-      const url = new URL(href, location.origin);
-      if (url.origin !== location.origin || !/^\/profile\/\d+\/?$/.test(url.pathname)) return null;
-      url.pathname = url.pathname.replace(/\/$/, "");
-      url.search = "";
-      url.hash = "";
-      return url;
-    } catch {
-      return null;
+    // Alliance badges can precede the player's name link in this container.
+    // Inspect every link, accepting only a same-origin numeric profile URL.
+    for (const link of document.querySelectorAll("aside.v2-left .v2-me__name a[href]")) {
+      try {
+        const url = new URL(link.getAttribute("href"), location.origin);
+        if (url.origin !== location.origin || !/^\/profile\/\d+\/?$/.test(url.pathname)) continue;
+        url.pathname = url.pathname.replace(/\/$/, "");
+        url.search = "";
+        url.hash = "";
+        return url;
+      } catch {
+        // An invalid badge URL must not hide a subsequent valid profile link.
+      }
     }
+    return null;
   }
 
   function readPlayerAlignment(profileUrl = getOwnProfileUrl()) {
