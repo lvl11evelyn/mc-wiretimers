@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Masked City Wire HUD Check-Ins
 // @namespace    https://maskedcity.com/
-// @version      1.0.11
+// @version      1.0.13
 // @description  Persist active Wire task check-ins in the HUD with countdown progress bars.
 // @author       lvl11evelyn
 // @match        https://maskedcity.com/*
@@ -23,7 +23,6 @@
   const ALIGNMENT_STORE_KEY = "wireHudPlayerAlignment:v1";
   const TICK_MS = 1000;
   const FEED_SCAN_MS = 30000;
-  const PAYOUT_RATIO_TOLERANCE = 0.025;
   // Known Hero-aligned Wire titles. Villain-side mirror titles may differ and
   // are still learned locally from the board when encountered.
   const KNOWN_JOB_STARS = {
@@ -174,11 +173,11 @@
 
   function savePlayerAlignment(profileUrl, data) {
     const previous = readPlayerAlignment(profileUrl);
-    // Pre-cache payout records may have been inferred using the selected theme.
+    // Relative turf records must be refreshed when the player's alignment changes.
     if (!previous || previous.alignment !== data.alignment) {
       const controls = readControlState();
       Object.keys(controls.districts).forEach((district) => {
-        if (controls.districts[district]?.source === "wire-payout") delete controls.districts[district];
+        if (["wire-payout", "wire-turf"].includes(controls.districts[district]?.source)) delete controls.districts[district];
       });
       writeControlState(controls);
     }
@@ -228,6 +227,16 @@
   function readControlState() {
     try {
       const state = JSON.parse(localStorage.getItem(CONTROL_STORE_KEY) || "null");
+      if (state?.districts) {
+        let changed = false;
+        Object.keys(state.districts).forEach((district) => {
+          if (state.districts[district]?.source === "wire-payout") {
+            delete state.districts[district];
+            changed = true;
+          }
+        });
+        if (changed) writeControlState(state);
+      }
       return state && state.districts ? state : { authorityAt: 0, districts: {} };
     } catch {
       localStorage.removeItem(CONTROL_STORE_KEY);
@@ -286,14 +295,6 @@
     return "";
   }
 
-  function getControlKind(control) {
-    if (!control) return "";
-    if (control.controller === "hero") return "hero";
-    if (control.controller === "villain") return "villain";
-    if (control.status === "siege" || control.controller === null) return "uncontrolled";
-    return "";
-  }
-
   function getControlIcon(kind) {
     if (kind === "hero") return "🛡️";
     if (kind === "villain") return "🏴‍☠️";
@@ -308,47 +309,25 @@
     return "";
   }
 
-  function relationToControlKind(relation) {
-    const alignment = getPlayerAlignment();
-    if (relation === "base") return "uncontrolled";
-    if (!alignment) return "";
-
-    if (relation === "friendly") return alignment;
-    if (relation === "opposing") return alignment === "hero" ? "villain" : "hero";
-    return "";
-  }
-
-  function ratiosMatch(first, second, target) {
-    if (!Number.isFinite(first) || !Number.isFinite(second) || !target) return false;
-    return Math.abs(first - target) / target <= PAYOUT_RATIO_TOLERANCE &&
-      Math.abs(second - target) / target <= PAYOUT_RATIO_TOLERANCE;
-  }
-
-  function inferPayoutRelationship(lowNote, highNote) {
-    if (!lowNote?.low || !lowNote?.high || !highNote?.low || !highNote?.high) return null;
-
-    const lowRatio = highNote.low / lowNote.low;
-    const highRatio = highNote.high / lowNote.high;
-    const relationships = [
-      { ratio: 1.25, low: "base", high: "friendly" },
-      { ratio: 1 / 0.85, low: "opposing", high: "base" },
-      { ratio: 1.25 / 0.85, low: "opposing", high: "friendly" },
-    ];
-
-    return relationships.find((item) => ratiosMatch(lowRatio, highRatio, item.ratio)) || null;
-  }
-
-  function saveWireInferredControls(inferred) {
-    const entries = Object.entries(inferred || {}).filter(([, kind]) => kind);
-    if (!entries.length) return;
-
+  function saveWireTurfControls(notes) {
+    const districts = new Map();
+    notes.forEach((note) => {
+      const district = normalizeDistrict(note.district);
+      const kind = turfToControlKind(note.turf);
+      // Conflicting or unreadable flags cannot establish district control.
+      districts.set(district, districts.has(district) && districts.get(district) !== kind ? "" : kind);
+    });
     const state = readControlState();
-    entries.forEach(([district, kind]) => {
-      state.districts[normalizeDistrict(district)] = buildControlRecord({
+    districts.forEach((kind, district) => {
+      if (!kind) {
+        if (state.districts[district]?.source === "wire-turf") delete state.districts[district];
+        return;
+      }
+      state.districts[district] = buildControlRecord({
         district,
         controller: kind === "hero" || kind === "villain" ? kind : null,
         status: kind === "uncontrolled" ? "siege" : "controlled",
-        source: "wire-payout",
+        source: "wire-turf",
       });
     });
     writeControlState(state);
@@ -477,9 +456,6 @@
     ensureStyles();
 
     const saved = readSavedNotes();
-    const controlState = readControlState();
-    const directByDistrict = {};
-    const inferredByDistrict = {};
     const noteRecords = [];
 
     notes.forEach((node) => {
@@ -491,6 +467,7 @@
         minutes: readNumber(node.dataset.minutes),
         low: readNumber(node.dataset.low),
         high: readNumber(node.dataset.high),
+        turf: node.hasAttribute("data-turf") ? node.dataset.turf.trim().toLowerCase() : null,
         node,
       };
 
@@ -506,63 +483,29 @@
       };
       noteRecords.push(note);
 
-      const district = normalizeDistrict(note.district);
-      const directKind = getControlKind(controlState.districts[district]);
-      if (directKind) directByDistrict[district] = directKind;
-
       if (!node.dataset.wireHudClickBound) {
         node.dataset.wireHudClickBound = "1";
         node.addEventListener("click", () => writePendingNote(saved[getNoteKey(note)]), { passive: true });
       }
     });
 
-    inferBoardDistrictControls(noteRecords, inferredByDistrict);
-    saveWireInferredControls(inferredByDistrict);
-    annotateBoardNotes(noteRecords, inferredByDistrict, directByDistrict);
+    saveWireTurfControls(noteRecords);
+    annotateBoardNotes(noteRecords);
     localStorage.setItem(NOTE_STORE_KEY, JSON.stringify(saved));
   }
 
-  function inferBoardDistrictControls(notes, inferredByDistrict) {
-    const byStars = new Map();
-
-    notes.forEach((note) => {
-      if (!note.stars || !note.low || !note.high) return;
-      if (!byStars.has(note.stars)) byStars.set(note.stars, []);
-      byStars.get(note.stars).push(note);
-    });
-
-    byStars.forEach((starNotes) => {
-      for (let index = 0; index < starNotes.length; index += 1) {
-        for (let compareIndex = index + 1; compareIndex < starNotes.length; compareIndex += 1) {
-          const first = starNotes[index];
-          const second = starNotes[compareIndex];
-          if (normalizeDistrict(first.district) === normalizeDistrict(second.district)) continue;
-
-          const ordered = first.low <= second.low ? [first, second] : [second, first];
-          const relationship = inferPayoutRelationship(ordered[0], ordered[1]);
-          if (!relationship) continue;
-
-          const lowKind = relationToControlKind(relationship.low);
-          const highKind = relationToControlKind(relationship.high);
-          setInferredDistrictKind(inferredByDistrict, ordered[0].district, lowKind);
-          setInferredDistrictKind(inferredByDistrict, ordered[1].district, highKind);
-        }
-      }
-    });
+  function turfToControlKind(turf) {
+    if (turf === "") return "uncontrolled";
+    const alignment = getPlayerAlignment();
+    if (!alignment) return "";
+    if (turf === "own") return alignment;
+    if (turf === "enemy") return alignment === "hero" ? "villain" : "hero";
+    return "";
   }
 
-  function setInferredDistrictKind(inferredByDistrict, district, kind) {
-    if (!kind) return;
-
-    const normalizedDistrict = normalizeDistrict(district);
-    const existing = inferredByDistrict[normalizedDistrict];
-    inferredByDistrict[normalizedDistrict] = existing && existing !== kind ? "" : kind;
-  }
-
-  function annotateBoardNotes(notes, inferredByDistrict, directByDistrict) {
+  function annotateBoardNotes(notes) {
     notes.forEach((note) => {
-      const district = normalizeDistrict(note.district);
-      const kind = inferredByDistrict[district] || directByDistrict[district] || "";
+      const kind = turfToControlKind(note.turf);
       const icon = getControlIcon(kind);
       const controlClass = getControlClass(kind);
 
@@ -578,12 +521,12 @@
       const label = kind === "hero" ? "Hero controlled" : kind === "villain" ? "Villain controlled" : "Contested";
       const marker = existing || document.createElement("span");
       marker.className = "wire-note-control";
-      marker.textContent = icon;
+      if (marker.textContent !== icon) marker.textContent = icon;
       marker.title = label;
       marker.setAttribute("aria-label", label);
 
       const meta = note.node.querySelector(".wb-note__meta");
-      const districtLabel = meta?.firstElementChild;
+      const districtLabel = meta ? Array.from(meta.children).find((child) => child !== marker) : null;
       const target = meta || note.node.querySelector(".wb-note__body") || note.node;
 
       if (districtLabel) {
@@ -1152,10 +1095,15 @@
     if (!board) return;
 
     boardObserver = new MutationObserver((mutations) => {
-      if (!mutations.some((mutation) => mutation.type === "childList")) return;
+      if (!mutations.some((mutation) => mutation.type === "childList" || mutation.type === "attributes")) return;
       queueBoardScan();
     });
-    boardObserver.observe(board, { childList: true, subtree: true });
+    boardObserver.observe(board, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-turf", "data-district", "data-stars", "data-minutes"],
+    });
   }
 
   function render(job) {
